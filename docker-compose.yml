@@ -1,0 +1,127 @@
+# PHASE 3: Docker Compose for Local Development
+# Simplified deployment for testing without Kubernetes
+
+version: '3.8'
+
+services:
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.11-slim
+    container_name: phase3-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow_artifacts:/mlflow
+    working_dir: /app
+    command: >
+      bash -c "pip install mlflow &&
+               mlflow ui --host 0.0.0.0 --port 5000
+               --backend-store-uri sqlite:////mlflow/mlflow.db"
+    networks:
+      - phase3-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI Inference Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phase3-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./final_model.pkl:/app/final_model.pkl:ro
+      - ./prediction_logs:/app/prediction_logs
+      - ./monitoring_reports:/app/monitoring_reports
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - LOG_LEVEL=info
+      - MONITORING_ENABLED=true
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - phase3-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # PostgreSQL for Monitoring Data (Optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: phase3-postgres
+    environment:
+      POSTGRES_USER: monitoring
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: monitoring
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - phase3-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitoring"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Prometheus for Metrics (Optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: phase3-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - phase3-network
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana for Visualization (Optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: phase3-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - phase3-network
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  phase3-network:
+    driver: bridge
+
+# Usage:
+# docker-compose up -d          # Start all services
+# docker-compose logs -f api     # View API logs
+# docker-compose ps             # List running containers
+# docker-compose down            # Stop all services

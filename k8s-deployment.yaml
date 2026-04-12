@@ -1,0 +1,347 @@
+---
+# PHASE 3: Kubernetes Deployment Configuration
+# Namespace for Phase 3 deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: transaction-risk-pred
+  labels:
+    phase: phase3-deployment
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: phase3-config
+  namespace: transaction-risk-pred
+data:
+  MODEL_VERSION: "phase1-v1"
+  LOG_LEVEL: "info"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  MONITORING_ENABLED: "true"
+
+---
+# Secret for sensitive data
+apiVersion: v1
+kind: Secret
+metadata:
+  name: phase3-secrets
+  namespace: transaction-risk-pred
+type: Opaque
+data:
+  # Base64 encoded secrets - update with actual values
+  # echo -n "secret_value" | base64
+  MLFLOW_TRACKING_TOKEN: ""
+  DATABASE_URL: ""
+
+---
+# Persistent Volume for model artifacts and logs
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-pv
+  namespace: transaction-risk-pred
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /data/ml-models
+
+---
+# Persistent Volume Claim for model storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-pvc
+  namespace: transaction-risk-pred
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Deployment: Transaction Risk Prediction API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-risk-api
+  namespace: transaction-risk-pred
+  labels:
+    app: transaction-risk-api
+    phase: phase3
+spec:
+  replicas: 3  # Start with 3 replicas for HA
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  selector:
+    matchLabels:
+      app: transaction-risk-api
+      phase: phase3
+  
+  template:
+    metadata:
+      labels:
+        app: transaction-risk-api
+        phase: phase3
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      # Init container to load model
+      initContainers:
+      - name: model-loader
+        image: transaction-risk-api:latest
+        imagePullPolicy: IfNotPresent
+        command: ['cp', '/app/final_model.pkl', '/models/final_model.pkl']
+        volumeMounts:
+        - name: model-volume
+          mountPath: /models
+      
+      containers:
+      - name: api-server
+        image: transaction-risk-api:latest
+        imagePullPolicy: IfNotPresent
+        
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        env:
+        - name: MODEL_VERSION
+          valueFrom:
+            configMapKeyRef:
+              name: phase3-config
+              key: MODEL_VERSION
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: phase3-config
+              key: LOG_LEVEL
+        - name: MLFLOW_TRACKING_URI
+          valueFrom:
+            configMapKeyRef:
+              name: phase3-config
+              key: MLFLOW_TRACKING_URI
+        - name: MONITORING_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: phase3-config
+              key: MONITORING_ENABLED
+        
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        
+        # Volume mounts
+        volumeMounts:
+        - name: model-volume
+          mountPath: /app/models
+        - name: logs-volume
+          mountPath: /app/prediction_logs
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      
+      # Volumes
+      volumes:
+      - name: model-volume
+        persistentVolumeClaim:
+          claimName: model-pvc
+      - name: logs-volume
+        emptyDir: {}
+      
+      # Pod security
+      securityContext:
+        fsGroup: 1000
+      
+      # Affinity rules
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - transaction-risk-api
+              topologyKey: kubernetes.io/hostname
+
+---
+# Service: LoadBalancer for API access
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-risk-api-service
+  namespace: transaction-risk-pred
+  labels:
+    app: transaction-risk-api
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: transaction-risk-api
+
+---
+# Service: ClusterIP for internal communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-risk-api-internal
+  namespace: transaction-risk-pred
+  labels:
+    app: transaction-risk-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: transaction-risk-api
+
+---
+# HorizontalPodAutoscaler for dynamic scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: transaction-risk-api-hpa
+  namespace: transaction-risk-pred
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: transaction-risk-api
+  
+  minReplicas: 2
+  maxReplicas: 10
+  
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 2
+        periodSeconds: 15
+      selectPolicy: Max
+
+---
+# NetworkPolicy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: transaction-risk-api-policy
+  namespace: transaction-risk-pred
+spec:
+  podSelector:
+    matchLabels:
+      app: transaction-risk-api
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+  
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+
+---
+# ServiceMonitor for Prometheus monitoring (if using Prometheus Operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: transaction-risk-api-monitor
+  namespace: transaction-risk-pred
+spec:
+  selector:
+    matchLabels:
+      app: transaction-risk-api
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
